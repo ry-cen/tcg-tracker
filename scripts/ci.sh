@@ -29,6 +29,8 @@ export CATALOG_PROCESS_FIXTURE_DIR="$(mktemp -d)"
 export PRICE_RUNNER_LOCK_DIR="$(mktemp -d)"
 export VERIFY_SUITE="${VERIFY_SUITE:-all}"
 export VERIFY_FAST="${VERIFY_FAST:-}"
+# K/N from scripts/verify.py --shard: run the K-th of N parts of the api or browser suite's test files.
+export VERIFY_SHARD="${VERIFY_SHARD:-}"
 export VERIFY_WORK="$(mktemp -d)"
 export VERIFY_PYTEST_WORKER_ROOT="$VERIFY_WORK/pytest"
 pids=()
@@ -68,11 +70,21 @@ case "$VERIFY_SUITE" in
   all|api|browser|auth|operations|burn-in) ;;
   *) echo 'Unknown verification suite' >&2; exit 1 ;;
 esac
+# Only the api and browser runners take a shard; any other suite would run whole while its caller expected one part.
+case "$VERIFY_SUITE:$VERIFY_SHARD" in
+  *:|api:*|browser:*) ;;
+  *) echo 'VERIFY_SHARD needs the api or browser suite' >&2; exit 1 ;;
+esac
 phase setup start
 .venv/bin/python scripts/migrate.py
 .venv/bin/python scripts/init_public_projection.py
 .venv/bin/python scripts/backfill_public_catalog.py
-case "$VERIFY_SUITE" in api) ;; *) npm run guardrails; npm run build ;; esac
+# A browser shard is one leg of the split CI gate (.github/workflows/verify.yml): its stacks serve web/ through the vite
+# dev server and never read the build output, and the auth leg runs guardrails and the build once for every leg.
+case "$VERIFY_SUITE:$VERIFY_SHARD" in
+  api:*|browser:?*) ;;
+  *) npm run guardrails; npm run build ;;
+esac
 case "$VERIFY_SUITE" in
   all) .venv/bin/python scripts/verify_resources.py prepare --pytest --stacks ;;
   api) .venv/bin/python scripts/verify_resources.py prepare --pytest ;;
@@ -99,7 +111,7 @@ phase setup end
 case "$VERIFY_SUITE" in
   all|api)
     phase pytest start
-    .venv/bin/python scripts/run_pytest.py ${VERIFY_FAST:+--fast} -- "$@"
+    .venv/bin/python scripts/run_pytest.py ${VERIFY_FAST:+--fast} ${VERIFY_SHARD:+--shard "$VERIFY_SHARD"} -- "$@"
     phase pytest end
     ;;
 esac
@@ -138,7 +150,8 @@ case "$VERIFY_SUITE" in
   all|browser|burn-in)
     if [ "$VERIFY_SUITE" != burn-in ] || [ "$#" -gt 0 ]; then
       phase browser start
-      .venv/bin/python scripts/run_playwright.py --workers "$stacks" ${VERIFY_FAST:+--fast} --repeat-each "${VERIFY_REPEAT:-1}" -- "$@"
+      .venv/bin/python scripts/run_playwright.py --workers "$stacks" ${VERIFY_FAST:+--fast} --repeat-each "${VERIFY_REPEAT:-1}" \
+        ${VERIFY_SHARD:+--shard "$VERIFY_SHARD"} -- "$@"
       phase browser end
     fi
     ;;

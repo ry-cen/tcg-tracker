@@ -16,10 +16,109 @@ on:
 permissions:
   contents: read
 jobs:
-  verify:
+  # The fast tier, split into legs that run at once, each on its own runner with its own database server and stacks:
+  # three shards of api/tests, the auth leg (guardrails, the build and vitest, run once for every leg) and ten shards
+  # of the Playwright specs (scripts/verify.py --shard). On one hosted runner the fast tier took about 32 minutes, 22
+  # of them in Playwright (October 2026); a leg takes about 5. inputs.full is empty on pull_request and workflow_call,
+  # so those always run the legs.
+  legs:
+    if: ${{ !inputs.full }}
+    name: ${{ matrix.leg }}
     runs-on: ubuntu-latest
-    # A passing full gate takes about 19 minutes on a hosted runner.
-    timeout-minutes: 35
+    timeout-minutes: 15
+    strategy:
+      # Every leg runs to the end, so one leg's failure doesn't hide another's.
+      fail-fast: false
+      matrix:
+        include:
+          - leg: api-1
+            args: --suite api --fast --shard 1/3
+          - leg: api-2
+            args: --suite api --fast --shard 2/3
+          - leg: api-3
+            args: --suite api --fast --shard 3/3
+          - leg: auth
+            args: --suite auth --fast
+            browsers: true
+          - leg: browser-1
+            args: --suite browser --fast --shard 1/10
+            browsers: true
+          - leg: browser-2
+            args: --suite browser --fast --shard 2/10
+            browsers: true
+          - leg: browser-3
+            args: --suite browser --fast --shard 3/10
+            browsers: true
+          - leg: browser-4
+            args: --suite browser --fast --shard 4/10
+            browsers: true
+          - leg: browser-5
+            args: --suite browser --fast --shard 5/10
+            browsers: true
+          - leg: browser-6
+            args: --suite browser --fast --shard 6/10
+            browsers: true
+          - leg: browser-7
+            args: --suite browser --fast --shard 7/10
+            browsers: true
+          - leg: browser-8
+            args: --suite browser --fast --shard 8/10
+            browsers: true
+          - leg: browser-9
+            args: --suite browser --fast --shard 9/10
+            browsers: true
+          - leg: browser-10
+            args: --suite browser --fast --shard 10/10
+            browsers: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: npm ci
+      - run: python -m venv .venv && .venv/bin/pip install -r api/requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client-16
+      # The api legs start no browser, so they skip the download.
+      - if: ${{ matrix.browsers }}
+        run: npx playwright install --with-deps chromium
+      - run: npm run verify -- ${{ matrix.args }}
+        env:
+          TEST_ADMIN_DATABASE_URL: postgresql://postgres:test-only-password@127.0.0.1:5432/postgres
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ matrix.leg }}
+          path: .scratch/verification/
+          retention-days: 7
+          include-hidden-files: true
+  # The full gate, unsharded, on demand: Actions -> Verify -> Run workflow with full ticked.
+  full:
+    if: ${{ inputs.full }}
+    runs-on: ubuntu-latest
+    # Well above the unsharded fast tier's 32 minutes on a hosted runner, since the full gate adds the slow tests and
+    # the operations suite.
+    timeout-minutes: 75
     services:
       postgres:
         image: postgres:16
@@ -50,7 +149,7 @@ jobs:
       - run: python -m venv .venv && .venv/bin/pip install -r api/requirements.txt
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client-16
       - run: npx playwright install --with-deps chromium
-      - run: npm run verify${{ !inputs.full && ' -- --fast' || '' }}
+      - run: npm run verify
         env:
           TEST_ADMIN_DATABASE_URL: postgresql://postgres:test-only-password@127.0.0.1:5432/postgres
       - uses: actions/upload-artifact@v4
@@ -60,3 +159,21 @@ jobs:
           path: .scratch/verification/
           retention-days: 7
           include-hidden-files: true
+  # The one check that stands for the whole run: pull requests and deploy-dev.yml's images job wait on "verify".
+  # always() makes it run and fail after a failed or cancelled leg instead of being skipped with it, because a skipped
+  # check counts as passing.
+  verify:
+    needs: [legs, full]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the legs, or the full gate, to have passed
+        env:
+          FULL: ${{ inputs.full && 'true' || 'false' }}
+          LEGS_RESULT: ${{ needs.legs.result }}
+          FULL_RESULT: ${{ needs.full.result }}
+        # The mode this run chose must report success: a job skipped by a wrong condition fails here instead of passing.
+        run: |
+          echo "full gate requested: $FULL; legs: $LEGS_RESULT; full gate: $FULL_RESULT"
+          if [ "$FULL" = true ]; then test "$FULL_RESULT" = success; else test "$LEGS_RESULT" = success; fi

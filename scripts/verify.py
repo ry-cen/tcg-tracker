@@ -1,5 +1,6 @@
 """Isolated verification. Optional selectors after --: pytest arguments with --suite api, Playwright with --suite browser.
---burn-in repeats the vitest files and Playwright specs changed against the merge base with --base (origin/dev)."""
+--burn-in repeats the vitest files and Playwright specs changed against the merge base with --base (origin/dev).
+--shard K/N runs the K-th of N parts of --suite api or --suite browser, as the CI legs of the fast tier do."""
 import argparse
 from datetime import datetime, timezone
 import json
@@ -39,6 +40,17 @@ def default_workers():
     return min(6, max(2, cores // 2)), min(4, max(2, cores // 3))
 
 
+SHARD = re.compile(r'([1-9][0-9]*)/([1-9][0-9]*)')
+
+
+def shard_argument(text):
+    """argparse type of --shard: 'K/N' with 1 <= K <= N, returned as given."""
+    match = SHARD.fullmatch(text)
+    if not match or int(match[1]) > int(match[2]):
+        raise argparse.ArgumentTypeError(f'{text!r} is not K/N with 1 <= K <= N')
+    return text
+
+
 def parse_arguments(argv=None):
     pytest_workers, browser_workers = default_workers()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -53,6 +65,9 @@ def parse_arguments(argv=None):
     parser.add_argument('--repeat', type=int,
                         help='runs of each test: Playwright --repeat-each and vitest invocations; with --burn-in, '
                              '--suite browser or --suite auth')
+    parser.add_argument('--shard', type=shard_argument,
+                        help='K/N: run the K-th of N parts of --suite api or --suite browser (whole test files); a browser '
+                             'shard leaves guardrails and the build to another leg')
     parser.add_argument('selectors', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.selectors[:1] == ['--']:
@@ -63,6 +78,8 @@ def parse_arguments(argv=None):
         parser.error('--repeat needs --burn-in, --suite browser or --suite auth')
     if args.repeat is not None and args.repeat < 1:
         parser.error('--repeat must be at least 1')
+    if args.shard and (args.burn_in or args.suite not in ('api', 'browser')):
+        parser.error('--shard needs --suite api or --suite browser')
     if args.selectors and args.suite not in ('api', 'browser'):
         parser.error('Selectors after -- need --suite api or --suite browser')
     if args.pytest_workers < 1 or args.browser_workers < 1:
@@ -255,6 +272,17 @@ def repeat_settings(suite, repeat, plan):
     return (repeat or 1) if suite == 'browser' else 1, (repeat or 1) if suite == 'auth' else 1
 
 
+def verify_settings(suite, fast, shard, workers, stacks, browser_repeat, vitest_repeat, plan):
+    """The VERIFY_* settings scripts/ci.sh reads: the suite, tier and shard, the prepared pytest worker databases and
+    extra browser stacks, the repeats, and the burn-in's files. An unsharded run sets VERIFY_SHARD empty."""
+    return dict(VERIFY_SUITE=suite, VERIFY_FAST='1' if fast else '', VERIFY_SHARD=shard or '',
+                VERIFY_OPERATIONS='1' if runs_operations(suite, fast) else '0',
+                VERIFY_PYTEST_DATABASE_URLS=json.dumps(workers), VERIFY_EXTRA_STACKS=json.dumps(stacks),
+                VERIFY_REPEAT=str(browser_repeat), VERIFY_VITEST_REPEAT=str(vitest_repeat),
+                VERIFY_BURN_IN_VITEST=' '.join(plan['vitest']) if plan else '',
+                VERIFY_BURN_IN_SPECS=' '.join(plan['specs']) if plan else '')
+
+
 def gate_command(selectors):
     """ci.sh, kept from idle sleep where the host offers caffeinate (macOS). A closed lid on battery still sleeps."""
     command = ['bash', 'scripts/ci.sh', *selectors]
@@ -297,7 +325,7 @@ def main(argv=None):
                 result = 0 if plan else 1
                 (artifacts/'result.json').write_text(json.dumps({
                     'run': identifier, 'exit_code': result, 'suite': suite, 'selectors': [], 'browser_args': [],
-                    'fast': args.fast, 'burn_in': plan}))
+                    'fast': args.fast, 'shard': None, 'burn_in': plan}))
                 return result
         pytest_workers, browser_workers = effective_workers(suite, args.pytest_workers, args.browser_workers)
         if plan and not plan['specs']:
@@ -340,12 +368,7 @@ def main(argv=None):
               API_PORT=str(api), AUTH_PORT=str(auth), WEB_PORT=str(web),
               API_ORIGIN=f'http://127.0.0.1:{api}', TEST_ORIGIN=f'http://localhost:{web}',
               TEST_SIGNUP_PORT=str(signup), TEST_SECONDARY_AUTH_PORT=str(secondary), TEST_UNAVAILABLE_AUTH_PORT=str(unavailable),
-              VERIFY_SUITE=suite, VERIFY_FAST='1' if args.fast else '',
-              VERIFY_OPERATIONS='1' if runs_operations(suite, args.fast) else '0',
-              VERIFY_PYTEST_DATABASE_URLS=json.dumps(workers), VERIFY_EXTRA_STACKS=json.dumps(stacks),
-              VERIFY_REPEAT=str(browser_repeat), VERIFY_VITEST_REPEAT=str(vitest_repeat),
-              VERIFY_BURN_IN_VITEST=' '.join(plan['vitest']) if plan else '',
-              VERIFY_BURN_IN_SPECS=' '.join(plan['specs']) if plan else '',
+              **verify_settings(suite, args.fast, args.shard, workers, stacks, browser_repeat, vitest_repeat, plan),
               TEST_LOG_DIR=str(artifacts), TEST_BROWSER_OUTPUT=str(artifacts/'browser'), RELEASE_TEST_HISTORY_ROOT=str(ROOT))
             with psycopg.connect(args.admin_url, autocommit=True) as conn:
                 create_databases(conn, names, current_owner(identifier), created)
@@ -373,7 +396,7 @@ def main(argv=None):
                 timings = {'error': type(error).__name__}
             (artifacts/'result.json').write_text(json.dumps({
                 'run': identifier, 'exit_code': result, 'suite': suite, 'selectors': args.selectors,
-                'browser_args': args.selectors if suite == 'browser' else [], 'fast': args.fast,
+                'browser_args': args.selectors if suite == 'browser' else [], 'fast': args.fast, 'shard': args.shard,
                 'pytest_workers': pytest_workers, 'browser_workers': browser_workers, 'ports': ports, 'databases': names,
                 'database_removed': False, 'reaper': reaper, 'reaped_databases': reaped, 'timings': timings,
                 'host_suspended_seconds': suspended,

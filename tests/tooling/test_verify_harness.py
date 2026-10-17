@@ -1,23 +1,28 @@
 """Pure parts of the verification harness: scripts/verify.py, run_pytest.py, run_playwright.py, verify_resources.py,
-verify_report.py, verify_discard.py and verify_reaper.py. Nothing here needs a database, a browser or a network;
-api/tests/test_verify_reaper.py checks the reaper against PostgreSQL."""
+verify_report.py, verify_discard.py, verify_reaper.py, and the pytest shard split in api/tests/conftest.py. Nothing here
+needs a database, a browser or a network; api/tests/test_verify_reaper.py checks the reaper against PostgreSQL."""
 import importlib.util
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zipfile
 
-SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts'
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ROOT / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 
 
-def load(name):
-    spec = importlib.util.spec_from_file_location(name, SCRIPTS / f'{name}.py')
+def load(name, path=None):
+    spec = importlib.util.spec_from_file_location(name, path or SCRIPTS / f'{name}.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -30,6 +35,10 @@ verify_resources = load('verify_resources')
 verify_report = load('verify_report')
 verify_discard = load('verify_discard')
 verify_reaper = load('verify_reaper')
+# Importing the conftest applies an xdist worker's prepared settings when PYTEST_XDIST_WORKER is set; these tests only
+# need its pure shard split, so they load it as a plain process would.
+with mock.patch.dict(os.environ, {'PYTEST_XDIST_WORKER': ''}):
+    api_conftest = load('api_tests_conftest', ROOT / 'api' / 'tests' / 'conftest.py')
 ADMIN = 'postgresql://tcg@127.0.0.1:5432/postgres'
 
 
@@ -78,6 +87,39 @@ class VerifyArgumentsTest(unittest.TestCase):
         self.assertEqual(verify.repeat_settings('auth', 5, None), (1, 5))
         self.assertEqual(verify.repeat_settings('all', None, None), (1, 1))
         self.assertEqual(verify.repeat_settings('burn-in', None, {'repeat': 3, 'vitest_repeat': 5}), (3, 5))
+
+    def test_shard_is_k_of_n_for_the_api_or_browser_suite(self):
+        for suite in ('api', 'browser'):
+            self.assertEqual(verify.parse_arguments(['--admin-url', ADMIN, '--suite', suite, '--fast', '--shard', '3/10']).shard,
+                             '3/10')
+        self.assertEqual(verify.parse_arguments(['--admin-url', ADMIN, '--suite', 'api', '--shard', '1/1']).shard, '1/1')
+        self.assertIsNone(verify.parse_arguments(['--admin-url', ADMIN, '--suite', 'api']).shard)
+        for shard in ('0/3', '4/3', '3', '1/0', 'a/b', '1/3/5', ' 1/3', '01/3', '-1/3', ''):
+            with self.assertRaises(SystemExit, msg=shard):
+                verify.parse_arguments(['--admin-url', ADMIN, '--suite', 'api', '--shard', shard])
+        for argv in (['--shard', '1/3'], ['--suite', 'auth', '--shard', '1/3'], ['--suite', 'operations', '--shard', '1/3'],
+                     ['--burn-in', '--shard', '1/3']):
+            with self.assertRaises(SystemExit, msg=argv):
+                verify.parse_arguments(['--admin-url', ADMIN, *argv])
+
+    def test_the_shard_reaches_ci_sh_and_an_unsharded_run_sets_it_empty(self):
+        settings = verify.verify_settings('browser', True, '2/10', [], [], 1, 1, None)
+        self.assertEqual((settings['VERIFY_SUITE'], settings['VERIFY_FAST'], settings['VERIFY_SHARD']), ('browser', '1', '2/10'))
+        settings = verify.verify_settings('all', False, None, ['postgresql://tcg@127.0.0.1:5432/run_gw0'], [], 1, 1, None)
+        self.assertEqual((settings['VERIFY_SHARD'], settings['VERIFY_OPERATIONS']), ('', '1'))
+        self.assertEqual(json.loads(settings['VERIFY_PYTEST_DATABASE_URLS']), ['postgresql://tcg@127.0.0.1:5432/run_gw0'])
+        plan = {'vitest': ['auth/tests/a.test.ts'], 'specs': ['web/tests/b.spec.ts', 'web/tests/c.spec.ts'], 'repeat': 3,
+                'vitest_repeat': 5}
+        settings = verify.verify_settings('burn-in', True, None, [], [], 3, 5, plan)
+        self.assertEqual((settings['VERIFY_BURN_IN_VITEST'], settings['VERIFY_BURN_IN_SPECS'], settings['VERIFY_REPEAT']),
+                         ('auth/tests/a.test.ts', 'web/tests/b.spec.ts web/tests/c.spec.ts', '3'))
+
+    def test_ci_sh_shards_both_runners_and_leaves_the_build_to_unsharded_browser_runs(self):
+        gate = (SCRIPTS / 'ci.sh').read_text()
+        self.assertIn('scripts/run_pytest.py ${VERIFY_FAST:+--fast} ${VERIFY_SHARD:+--shard "$VERIFY_SHARD"} -- "$@"', gate)
+        self.assertIn('${VERIFY_SHARD:+--shard "$VERIFY_SHARD"} -- "$@"', gate.split('scripts/run_playwright.py', 1)[1])
+        self.assertIn('api:*|browser:?*) ;;', gate)
+        self.assertIn('VERIFY_SHARD needs the api or browser suite', gate)
 
     def test_databases_and_ports_follow_the_workers(self):
         self.assertEqual(verify.database_names('run', 2, 3), ['run', 'run_gw0', 'run_gw1', 'run_s1', 'run_s2'])
@@ -230,8 +272,16 @@ class RunPytestTest(unittest.TestCase):
         self.assertEqual(parallel[-1], 'api/tests/test_api.py')
 
     def test_selectors_follow_the_double_dash(self):
-        self.assertEqual(run_pytest.parse(['--fast', '--', '-k', 'x']), (True, ['-k', 'x']))
-        self.assertEqual(run_pytest.parse(['--']), (False, []))
+        self.assertEqual(run_pytest.parse(['--fast', '--', '-k', 'x']), (True, None, ['-k', 'x']))
+        self.assertEqual(run_pytest.parse(['--']), (False, None, []))
+        self.assertEqual(run_pytest.parse(['--fast', '--shard', '2/3', '--']), (True, '2/3', []))
+
+    def test_the_shard_reaches_pytest_and_an_inherited_one_is_dropped(self):
+        inherited = {'PATH': '/bin', 'VERIFY_PYTEST_SHARD': '9/9', 'PYTHONPATH': 'elsewhere'}
+        self.assertEqual(run_pytest.pytest_environment(inherited, '2/3'),
+                         {'PATH': '/bin', 'VERIFY_PYTEST_SHARD': '2/3', 'PYTHONPATH': 'api'})
+        self.assertEqual(run_pytest.pytest_environment(inherited, None), {'PATH': '/bin', 'PYTHONPATH': 'api'})
+        self.assertEqual(inherited['VERIFY_PYTEST_SHARD'], '9/9')
 
     def test_junit_counts_add_up_both_passes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -255,7 +305,15 @@ class RunPlaywrightTest(unittest.TestCase):
         self.assertEqual(serial[-2:], ['--repeat-each', '5'])
         self.assertNotIn('--repeat-each', run_playwright.passes(2, True)[0][1])
         self.assertEqual(run_playwright.parse(['--workers', '2', '--repeat-each', '3', '--', 'web/tests/moves.spec.ts']),
-                         (2, False, 3, ['web/tests/moves.spec.ts']))
+                         (2, False, 3, None, ['web/tests/moves.spec.ts']))
+
+    def test_a_shard_reaches_both_passes(self):
+        (_, parallel), (_, serial) = run_playwright.passes(2, True, 1, '3/10')
+        self.assertEqual(parallel, ['--workers', '2', '--grep-invert', '@serial|@slow', '--shard', '3/10'])
+        self.assertEqual(serial, ['--workers', '1', '--grep', '@serial', '--grep-invert', '@slow', '--shard', '3/10'])
+        self.assertTrue(all('--shard' not in arguments for _, arguments in run_playwright.passes(2, True)))
+        self.assertEqual(run_playwright.parse(['--workers', '2', '--fast', '--shard', '3/10', '--']), (2, True, 1, '3/10', []))
+        self.assertEqual(run_playwright.reserved_argument(['--shard=1/2']), '--shard=1/2')
 
     def test_runner_options_are_reserved(self):
         self.assertEqual(run_playwright.reserved_argument(['web/tests/moves.spec.ts', '--repeat-each=3']), '--repeat-each=3')
@@ -268,6 +326,63 @@ class RunPlaywrightTest(unittest.TestCase):
             first.write_text(json.dumps({'stats': {'expected': 50, 'unexpected': 1, 'flaky': 0, 'skipped': 1}}))
             second.write_text(json.dumps({'stats': {'expected': 1, 'unexpected': 0, 'flaky': 1, 'skipped': 0}}))
             self.assertEqual(run_playwright.report_totals([first, second]), {'passed': 51, 'failed': 1, 'flaky': 1, 'skipped': 1})
+
+
+class PytestShardTest(unittest.TestCase):
+    WEIGHTS = {f'api/tests/test_{number:03}.py': (number * 37) % 23 for number in range(130)}
+
+    def item(self, path, name, slow=False):
+        return SimpleNamespace(nodeid=f'{path}::{name}', get_closest_marker=lambda marker: object() if slow and marker == 'slow' else None)
+
+    def test_every_file_lands_in_exactly_one_shard(self):
+        for total in (1, 2, 3, 4, 10):
+            shards = api_conftest.shard_files(self.WEIGHTS, total)
+            self.assertEqual(set(shards), set(self.WEIGHTS), total)
+            self.assertTrue(set(shards.values()) <= set(range(total)), total)
+            parts = [{path for path, shard in shards.items() if shard == index} for index in range(total)]
+            self.assertEqual(sum(len(part) for part in parts), len(self.WEIGHTS))
+            self.assertEqual(set().union(*parts), set(self.WEIGHTS))
+
+    def test_the_split_ignores_input_order_and_balances_the_weight(self):
+        shards = api_conftest.shard_files(self.WEIGHTS, 3)
+        paths = list(self.WEIGHTS)
+        random.Random(7).shuffle(paths)
+        self.assertEqual(api_conftest.shard_files({path: self.WEIGHTS[path] for path in paths}, 3), shards)
+        loads = [sum(weight for path, weight in self.WEIGHTS.items() if shards[path] == index) for index in range(3)]
+        self.assertLessEqual(max(loads) - min(loads), max(self.WEIGHTS.values()))
+
+    def test_shard_settings_are_k_of_n(self):
+        self.assertIsNone(api_conftest.shard_setting(''))
+        self.assertEqual(api_conftest.shard_setting('2/3'), (2, 3))
+        for value in ('0/3', '4/3', '3', 'a/b', '1/3/5', '01/3'):
+            with self.assertRaises(pytest.UsageError, msg=value):
+                api_conftest.shard_setting(value)
+
+    def collect(self, items, shard):
+        config = SimpleNamespace(hook=SimpleNamespace(pytest_deselected=mock.Mock()))
+        kept = list(items)
+        with mock.patch.dict(os.environ, {'VERIFY_PYTEST_SHARD': shard}):
+            api_conftest.pytest_collection_modifyitems(config, kept)
+        return kept, config.hook.pytest_deselected
+
+    def test_the_hook_keeps_one_shard_in_order_and_reports_the_rest_deselected(self):
+        items = [self.item(f'api/tests/test_{path}.py', f'test_{number}', slow=path == 'c')
+                 for path in ('a', 'b', 'c', 'd', 'e') for number in range(len(path) + 'abcde'.index(path))]
+        seen = []
+        for number in (1, 2, 3):
+            kept, deselected = self.collect(items, f'{number}/3')
+            self.assertEqual(kept, [item for item in items if item in kept])  # collection order is kept
+            dropped = deselected.call_args.kwargs['items'] if deselected.called else []
+            self.assertEqual(len(kept) + len(dropped), len(items))
+            self.assertEqual({item.nodeid.split('::')[0] for item in kept} & {item.nodeid.split('::')[0] for item in dropped}, set())
+            seen += kept
+        self.assertEqual(sorted(item.nodeid for item in seen), sorted(item.nodeid for item in items))
+
+    def test_without_a_shard_the_hook_changes_nothing(self):
+        items = [self.item('api/tests/test_a.py', 'test_x')]
+        kept, deselected = self.collect(items, '')
+        self.assertEqual(kept, items)
+        deselected.assert_not_called()
 
 
 class VerifyResourcesTest(unittest.TestCase):
